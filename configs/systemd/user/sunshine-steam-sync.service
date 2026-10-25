@@ -1,0 +1,10 @@
+[Unit]
+Description=Synchronize installed Steam games into Sunshine Library
+# Run after the display/audio path and Sunshine are available.
+After=plasma-x11.service sunshine.service
+
+[Service]
+Type=oneshot
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/.local/bin/sunshine-sync-steam-games

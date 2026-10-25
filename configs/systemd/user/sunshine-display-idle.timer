@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic idle check for the on-demand Sunshine display stack
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

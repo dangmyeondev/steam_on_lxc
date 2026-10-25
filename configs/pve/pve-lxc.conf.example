@@ -1,0 +1,32 @@
+# /etc/pve/lxc/<CTID>.conf configuration snippet
+# Append these lines to your Proxmox LXC container configuration on the PVE host.
+# Note: Privileged container (unprivileged: 0) is recommended for device node access.
+
+# 1. Allow access to NVIDIA and DRI / uinput / uhid devices
+# Character device major numbers:
+# 195 = nvidia, 511 = nvidia-uvm, 226 = dri, 10 = misc (uinput, uhid), 13 = input
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 511:* rwm
+lxc.cgroup2.devices.allow: c 226:* rwm
+lxc.cgroup2.devices.allow: c 10:223 rwm
+lxc.cgroup2.devices.allow: c 10:239 rwm
+lxc.cgroup2.devices.allow: c 13:* rwm
+
+# 2. Bind-mount device nodes from Host into Container
+# NVIDIA core devices
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+
+# NVIDIA capabilities (if present on host)
+lxc.mount.entry: /dev/nvidia-caps dev/nvidia-caps none bind,optional,create=dir
+
+# DRI Direct Rendering Infrastructure
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
+
+# Input devices (uinput for Sunshine virtual gamepad/mouse, uhid, /dev/input)
+lxc.mount.entry: /dev/uinput dev/uinput none bind,optional,create=file
+lxc.mount.entry: /dev/uhid dev/uhid none bind,optional,create=file
+lxc.mount.entry: /dev/input dev/input none bind,optional,create=dir

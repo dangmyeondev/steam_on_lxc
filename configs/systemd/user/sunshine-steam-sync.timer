@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Steam game sync for Sunshine Library
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+# Guard: run only while the user session is active.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+{
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    },
+    {
+      "name": "Steam Gaming",
+      "cmd": "~/.local/bin/moonlight-steam",
+      "image-path": "steam.png"
+    }
+  ],
+  "env": {
+    "PATH": "$(PATH):$(HOME)/.local/bin"
+  }
+}

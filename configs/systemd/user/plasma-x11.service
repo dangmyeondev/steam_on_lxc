@@ -1,0 +1,11 @@
+[Unit]
+Description=KDE Plasma X11 on :0
+After=gaming-x.service
+[Service]
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startplasma-x11
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=default.target

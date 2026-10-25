@@ -1,0 +1,10 @@
+[Unit]
+Description=Xorg Dummy :0
+After=network.target systemd-udevd.service
+[Service]
+ExecStartPre=/bin/sh -c 'chmod 666 /dev/dri/renderD128 /dev/uinput 2>/dev/null; pkill Xorg 2>/dev/null; rm -f /tmp/.X0-lock; exit 0'
+ExecStart=/usr/bin/Xorg :0
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target

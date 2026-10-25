@@ -1,0 +1,3 @@
+# Allow members of group sudo to manage gaming-x.service without password
+# (Required for Sunshine on-demand display startup/shutdown scripts)
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/systemctl start gaming-x.service, /usr/bin/systemctl stop gaming-x.service, /usr/bin/systemctl restart gaming-x.service, /usr/bin/systemctl status gaming-x.service

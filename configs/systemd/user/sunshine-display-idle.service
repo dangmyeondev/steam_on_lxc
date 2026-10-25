@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop headless display stack when no Sunshine session is active
+
+[Service]
+Type=oneshot
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/.local/bin/sunshine-display-idle.sh

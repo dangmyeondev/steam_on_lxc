@@ -1,0 +1,15 @@
+[Unit]
+Description=Sunshine
+# On-demand display stack: X/KDE are started per-connection by
+# global_prep_cmd, so this only orders (and never requires) the desktop.
+After=plasma-x11.service
+[Service]
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+Environment=__NV_PRIME_RENDER_OFFLOAD=1
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+ExecStart=/usr/bin/sunshine
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target

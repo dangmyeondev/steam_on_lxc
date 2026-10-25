@@ -1,0 +1,14 @@
+[Unit]
+Description=Sunshine uinput to XTest bridge (LXC has no udev)
+After=plasma-x11.service sunshine.service
+Wants=plasma-x11.service sunshine.service
+
+[Service]
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/.local/bin/sunshine-input-bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

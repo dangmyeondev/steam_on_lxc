@@ -1,0 +1,18 @@
+# Sunshine Configuration Example
+# Place this at ~/.config/sunshine/sunshine.conf
+
+locale = ko
+origin_web_ui_allowed = wan
+# Allow access from your local subnet / domain
+# csrf_allowed_origins = https://192.168.1.31:47990
+system_tray = disabled
+gamepad = x360
+
+# Video Encoder: nvenc (NVIDIA Hardware Acceleration)
+encoder = nvenc
+hevc_mode = 0
+av1_mode = 0
+
+# Optional: On-demand display prep command
+# If you want Xorg to start only when a client connects, uncomment:
+# global_prep_cmd = [{"do": "~/.local/bin/sunshine-display-up.sh", "undo": "", "elevated": "false"}]

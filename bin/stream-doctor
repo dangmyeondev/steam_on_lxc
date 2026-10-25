@@ -1,0 +1,139 @@
+#!/bin/bash
+# stream-doctor — manage + troubleshoot Sunshine (:0) / CRD streaming sessions.
+# Usage: stream-doctor {status|check|restart <target>|logs <unit>|shot [:0|crd]|crd-display}
+# Targets for restart: all | x | plasma | sunshine | bridge | crd | audio
+# NEVER touches: nvidia driver, host/LXC conf, SDDM, xorg.conf.
+set -u
+export XDG_RUNTIME_DIR=/run/user/1000
+USER_UNITS="plasma-x11 sunshine input-bridge"
+
+crd_display() {
+  ps -eo args | grep -oP 'Xorg :\K\d+(?=.*chrome_remote_desktop)' | head -1
+}
+
+session_bus() { # $1 = DISPLAY, prints DBUS address of that display's plasmashell
+  local disp="$1" pid
+  for pid in $(pgrep -u "${USER:-sunshine}" plasmashell); do
+    if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -qx "DISPLAY=$disp"; then
+      tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2-
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_status() {
+  echo "== units =="
+  sudo systemctl is-active gaming-x "chrome-remote-desktop@sunshine" 2>/dev/null
+  systemctl --user is-active $USER_UNITS pipewire wireplumber 2>/dev/null
+  echo "== X servers =="
+  ps -eo pid,args | grep '[X]org :' | sed 's/-auth.*-nolisten/-auth .../'
+  echo "sockets: $(ls /tmp/.X11-unix/ 2>/dev/null | tr '\n' ' ')"
+  echo "CRD display: :$(crd_display || echo NONE)"
+  echo "== sessions =="
+  for p in $(pgrep -u "${USER:-sunshine}" -d' ' "kwin_x11|plasmashell"); do
+    d=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep ^DISPLAY=)
+    echo "$p $(ps -o comm= -p $p) $d"
+  done
+  echo "== gpu =="
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader 2>/dev/null
+  df -h / | tail -1
+}
+
+cmd_check() {
+  local fail=0
+  pass() { echo "ok   $1"; }
+  nope() { echo "FAIL $1"; fail=1; }
+  [ -S /tmp/.X11-unix/X0 ] && pass x0-socket || nope x0-socket
+  DISPLAY=:0 xrandr 2>/dev/null | grep -q 'DP-0 connected primary 1920x1080' \
+    && pass x0-1080p || nope x0-1080p
+  DISPLAY=:0 glxinfo 2>/dev/null | grep -q 'NVIDIA GeForce' \
+    && pass x0-nvidia-glx || nope x0-nvidia-glx
+  local found=1 _p
+  for _p in $(pgrep -u "${USER:-sunshine}" -f kwin_x11); do
+    if tr '\0' '\n' < /proc/$_p/environ 2>/dev/null | grep -q 'DISPLAY=:0'; then found=0; break; fi
+  done
+  [ $found -eq 0 ] && pass x0-kwin || nope x0-kwin
+  [ "$(kreadconfig6 --file kwinrc --group Compositing --key Enabled 2>/dev/null)" = false ] \
+    && pass x0-no-composite || nope x0-no-composite
+  ss -tln 2>/dev/null | grep -q ':47990' && pass sunshine-ports || nope sunshine-ports
+  grep -q 'h264_nvenc \[nvenc\]' ~/.config/sunshine/sunshine.log* 2>/dev/null \
+    && pass sunshine-nvenc || nope sunshine-nvenc
+  pgrep -u "${USER:-sunshine}" -f chrome-remote-desktop-host >/dev/null \
+    && pass crd-host || nope crd-host
+  [ "$(stat -c '%u:%g %a' /sbin/unix_chkpwd)" = '0:42 2755' ] \
+    && pass unix_chkpwd || nope unix_chkpwd
+  if sudo -n true 2>/dev/null; then
+    sudo test -f /etc/polkit-1/rules.d/49-sunshine-nm.rules 2>/dev/null \
+      && pass polkit-nm-rule || nope polkit-nm-rule
+  else
+    echo "SKIP polkit-nm-rule (needs sudo; rule dir is root-only, loaded ok 2026-10-16)"
+  fi
+  return $fail
+}
+
+cmd_restart() {
+  local t="${1:-}"; [ -z "$t" ] && { echo "restart what? all|x|plasma|sunshine|bridge|crd|audio"; return 1; }
+  case "$t" in
+    sunshine) systemctl --user restart sunshine ;;
+    bridge) systemctl --user restart input-bridge ;;
+    plasma) systemctl --user restart plasma-x11 ;;
+    audio) systemctl --user restart pipewire pipewire-pulse wireplumber ;;
+    x)
+      systemctl --user stop sunshine input-bridge plasma-x11
+      sudo systemctl restart gaming-x
+      echo "waiting for :0..."; for i in $(seq 1 20); do [ -S /tmp/.X11-unix/X0 ] && break; sleep 1; done
+      systemctl --user start plasma-x11; sleep 12
+      systemctl --user start input-bridge sunshine
+      ;;
+    crd) sudo systemctl restart "chrome-remote-desktop@sunshine" ;;
+    all)
+      systemctl --user stop sunshine input-bridge plasma-x11
+      sudo systemctl restart gaming-x "chrome-remote-desktop@sunshine"
+      echo "waiting for :0..."; for i in $(seq 1 20); do [ -S /tmp/.X11-unix/X0 ] && break; sleep 1; done
+      # drop stale dead-display plasmashells and dead X sockets
+      for p in $(pgrep -u "${USER:-sunshine}" plasmashell); do
+        d=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep ^DISPLAY= | cut -d= -f2)
+        [ -n "$d" ] && [ ! -S "/tmp/.X11-unix/X${d#:}" ] && { echo "killing stale plasmashell $p ($d)"; kill $p; }
+      done
+      for s in /tmp/.X11-unix/X*; do
+        n=${s##*X}; ps -eo args | grep -q "[X]org :$n" || rm -f $s
+      done
+      systemctl --user start plasma-x11; sleep 12
+      systemctl --user start input-bridge sunshine
+      ;;
+    *) echo "unknown target: $t"; return 1 ;;
+  esac
+  sleep 3; cmd_status | head -12
+}
+
+cmd_logs() {
+  local u="${1:-sunshine}"
+  case "$u" in
+    gaming-x|chrome-remote-desktop*) sudo journalctl --no-pager -u "$u" -n 40 ;;
+    *) XDG_RUNTIME_DIR=/run/user/1000 journalctl --no-pager --user -u "$u" -n 40 ;;
+  esac
+}
+
+cmd_shot() {
+  local t="${1:-:0}" out="/tmp/stream-doctor-shot.png"
+  if [ "$t" = "crd" ]; then
+    local d=":$(crd_display || echo 20)"
+    DISPLAY=$d XAUTHORITY=~/.Xauthority xwd -root -silent -out /tmp/shot.xwd \
+      && convert /tmp/shot.xwd "$out" && echo "saved $out ($d)"
+  else
+    local bus; bus=$(session_bus ":0") || { echo "no :0 session bus"; return 1; }
+    DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="$bus" XDG_CURRENT_DESKTOP=KDE \
+      spectacle -b -f -n -o "$out" 2>/dev/null && echo "saved $out (:0)"
+  fi
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  check) cmd_check ;;
+  restart) cmd_restart "${2:-}" ;;
+  logs) cmd_logs "${2:-sunshine}" ;;
+  shot) cmd_shot "${2:-:0}" ;;
+  crd-display) echo ":$(crd_display || echo NONE)" ;;
+  *) echo "usage: $0 {status|check|restart <target>|logs <unit>|shot [:0|crd]|crd-display}"; exit 1 ;;
+esac

@@ -1,0 +1,375 @@
+#!/bin/bash
+# moonlight-steam: Moonlight "Steam Gaming" entry point.
+# Tries nested gamescope (cached probe); falls back to direct Steam Big Picture.
+# Lifecycle: opens Big Picture, waits while Steam lives.
+# On stream end Sunshine sends TERM -> we close Big Picture and exit (no killall).
+set -u
+
+# Crash loops (CEF GPU process, exit 8704) used to dump 300MB+ cores into
+# ~/.steam/debian-installation until the 94G disk was 94% full. Cores are never
+# useful here, so disable dumping for every child Steam/gamescope spawns.
+ulimit -c 0 2>/dev/null || true
+
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+# The on-demand display stack starts X only when a stream begins
+# (sunshine-display-up.sh). If X is still booting, wait briefly here so
+# gamescope/Steam never race a half-up server.
+for _ in $(seq 1 40); do
+    if xset -display "$DISPLAY" q >/dev/null 2>&1; then break; fi
+    sleep 0.5
+done
+if [ -S "$XDG_RUNTIME_DIR/bus" ] && [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+# 32-bit NVIDIA userspace at /usr/lib/i386-linux-gnu (Debian multiarch, 595.91.07)
+# Now in ld.so.conf, but keep explicit for safety. glibc skips wrong-arch libs.
+export LD_LIBRARY_PATH="/usr/lib/i386-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# NVIDIA Vulkan ICD — required for gamescope (system icd.d lacks nvidia)
+export VK_ICD_FILENAMES="$HOME/nvidia-vk/nvidia_icd.json"
+# NOTE (2026-09-19): __VK_LAYER_NV_optimus unset on purpose — forcing the
+# NVIDIA Vulkan layer crashed Steam's CEF GPU process (crash loop, exit 8704)
+# and left Big Picture software-rendered. Games still get NVIDIA via
+# PROTON_ENABLE_NVAPI=1 / PROTON_HIDE_NVIDIA_GPU=0 + DXVK enumeration.
+unset __VK_LAYER_NV_optimus
+# Never propagate LD_PRELOAD into Steam (see GAMERUN note above).
+unset LD_PRELOAD
+# Force NVIDIA Vulkan, enable NVAPI for Proton/DXVK, prefer host libs off (use SteamRT)
+export PROTON_ENABLE_NVAPI=1
+export PROTON_HIDE_NVIDIA_GPU=0
+export DXVK_ASYNC=1
+export VKD3D_CONFIG=dxr
+# De-prioritize Nix profile (its vulkaninfo/lib shadowing breaks loader diagnostics)
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games:$HOME/.local/bin:$HOME/.nix-profile/bin:$PATH
+# Prefer gamescope frame pacing over Steam overlay throttling
+export STEAM_FRAME_FORCE_CLOSE=0
+# Big Picture CEF fix: force GLX to restore GPU acceleration on X11
+# (prevents software-rendering lag). Must be set before Steam starts.
+export STEAM_RUNTIME=1
+# NOTE (2026-09-19 #3): -cef-force-glx RESTORED. A/B result: without it, CEF
+# never launches gpu-process AND Big Picture windows don't materialize
+# (stalled after renderer/utility spawn). Flag is load-bearing for window
+# creation; GPU-compositing crash (exit 8704) remains a separate open issue.
+#
+# FIX (2026-09-19): --use-angle=gl forces ANGLE to use native GLX instead of
+# Vulkan backend. Root cause of exit 8704 loop: ANGLE's Vulkan backend creates
+# a GL context that triggers GL_UNKNOWN_CONTEXT_RESET_KHR → exit_on_context_lost
+# policy kills GPU process → restart loop → permanent software fallback.
+# GLX path uses NVIDIA's proven driver (glxinfo confirms direct rendering Yes).
+# --disable-gpu-sandbox: LXC's namespace/bwrap can interfere with sandbox
+# GPU context preservation — disabling it isolates the GPU process.
+STEAM_CEF_FLAGS="-no-cef-sandbox -cef-force-glx --use-angle=gl --disable-gpu-sandbox"
+
+STEAM=/usr/games/steam
+GS=/usr/local/bin/gamescope
+APP_ID=""
+
+# Optional generated Sunshine Library entries pass a Steam app ID. With no
+# argument this remains the original Steam Gaming / Big Picture entry point.
+if [ "$#" -gt 0 ]; then
+    if [ "$#" -eq 2 ] && [ "$1" = "--app-id" ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+        APP_ID="$2"
+    else
+        printf '%s\n' "usage: $0 [--app-id <numeric Steam app id>]" >&2
+        exit 2
+    fi
+fi
+# NOTE (2026-09-19): gamemoderun DISABLED on purpose. Its LD_PRELOAD
+# (libgamemodeauto.so.0) interposes D-Bus and crashes EVERY Steam child:
+#   LD_PRELOAD=...libgamemodeauto.so.0 lsof -> dbus_pending_call_block
+#   assertion "pending != NULL" -> SIGABRT (exit 134). Reproduced 2026-09-19.
+# This single cause explains: lsof 134 (GetIPCConnectionDetails), the 9000+
+# D-Bus abort loop, steamwebhelper websocket failure, and the 0x3008 dialog.
+# GameMode's CPU-governor benefit is not worth breaking Steam IPC.
+# To re-enable (after upstream fix), uncomment the line below.
+GAMERUN=""
+# command -v gamemoderun >/dev/null 2>&1 && GAMERUN="gamemoderun"
+
+log() { echo "[moonlight-steam] $*"; }
+
+steam_pid() { pgrep -u "${USER:-sunshine}" -x steam 2>/dev/null | head -1; }
+
+check_gamescope() {
+    # Check if gamescope binary exists and NVIDIA Vulkan ICD is available.
+    # Previous runtime probes were unreliable (segfaults from lingering processes,
+    # -e embedded mode hangs). Binary + ICD check is sufficient since we verified
+    # gamescope + NVIDIA works (2026-09-19, 1920x1080 BPM confirmed via screenshot).
+    if [ -x "$GS" ] && [ -f "$HOME/nvidia-vk/nvidia_icd.json" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Session supervision state (used by the supervisor loop at the bottom).
+GAMESCOPE_STARTED=0
+WATCHER_PID=""
+PAD_SEEN=0
+DISCONNECT_FLAG="$HOME/.cache/moonlight-steam.disconnect"
+
+start_disconnect_watcher() {
+    # Deterministic disconnect signal: Sunshine logs CLIENT DISCONNECTED the
+    # moment the client goes away. Polling for the pad /sys node alone races
+    # (Sunshine destroys it on disconnect and recreates it on reconnect, so a
+    # poll that only samples every few seconds can miss the gap entirely), and
+    # a missed gap leaves gamescope/SDL holding a dead joystick fd, which is
+    # exactly why the pad was broken after disconnect+reconnect.
+    rm -f "$DISCONNECT_FLAG"
+    (
+        tail -n0 -F "$HOME/.config/sunshine/sunshine.log" 2>/dev/null | \
+        while IFS= read -r line; do
+            case "$line" in
+                *"CLIENT DISCONNECTED"*) : > "$DISCONNECT_FLAG" ;;
+                *"CLIENT CONNECTED"*) rm -f "$DISCONNECT_FLAG" ;;
+            esac
+        done
+    ) &
+    WATCHER_PID=$!
+}
+
+stop_disconnect_watcher() {
+    [ -n "$WATCHER_PID" ] || return 0
+    pkill -P "$WATCHER_PID" 2>/dev/null || true
+    kill "$WATCHER_PID" 2>/dev/null || true
+    WATCHER_PID=""
+}
+
+# Proactive cleanup on session end: force-kill Steam and gamescope so the next
+# Artemis/Moonlight connection starts from a completely clean state. Without
+# this, a lingering Steam process can prevent Sunshine from destroying its
+# virtual uinput devices, and the next session's gamescope may miss the newly
+# created gamepad.
+kill_steam_and_gamescope() {
+    # Graceful first
+    pkill -x -u "${USER:-sunshine}" steam 2>/dev/null || true
+    pkill -x -u "${USER:-sunshine}" gamescope 2>/dev/null || true
+    sleep 2
+    # Force if still alive. SDL backend in gamescope can keep stale joystick
+    # device fds open through a SIGTERM; SIGKILL is required to let Sunshine
+    # destroy and recreate its virtual uinput gamepad on the next Moonlight
+    # reconnect (this LXC has no udev daemon, so device hotplug is fragile).
+    pkill -9 -x -u "${USER:-sunshine}" steam 2>/dev/null || true
+    pkill -9 -x -u "${USER:-sunshine}" gamescope 2>/dev/null || true
+    # Longer wait so all child processes (steamwebhelper, CEF GPU, etc.) and
+    # their input file descriptors are fully released before Sunshine recreates
+    # the virtual gamepad.
+    sleep 5
+}
+
+cleanup() {
+    stop_disconnect_watcher
+    rm -f "$DISCONNECT_FLAG"
+    if declare -F close_gamepad_countdown >/dev/null; then
+        close_gamepad_countdown
+    fi
+    log "session ending"
+    if [ -n "$APP_ID" ]; then
+        :  # game entries rely on the wrapper exit to terminate the session
+    else
+        "$STEAM" "steam://close/bigpicture" >/dev/null 2>&1 || true
+    fi
+    kill_steam_and_gamescope
+    log "steam/gamescope cleaned up"
+    exit 0
+}
+trap cleanup TERM INT
+
+if ! nvidia-smi -L >/dev/null 2>&1; then
+    log "WARNING: nvidia-smi failed, continuing anyway"
+fi
+
+# Kill any leftover Steam/gamescope from a previous session before starting.
+# This is critical for reconnection stability in this LXC (no udev daemon):
+# a stale Steam holds references to old uinput devices, preventing Sunshine from
+# cleanly destroying them. The next session then races with stale device nodes.
+if [ -n "$(steam_pid)" ] || pgrep -u "${USER:-sunshine}" -x gamescope >/dev/null 2>&1; then
+    log "killing leftover Steam/gamescope from previous session"
+    kill_steam_and_gamescope
+fi
+
+# Sunshine creates its virtual Xbox pad only after the Moonlight client sends its
+# first controller packet. In this LXC there is no udev daemon, so gamescope must
+# be started only after that `/dev/input/jsN` node exists; otherwise its input
+# backend never receives the virtual device. Wait up to 60 seconds for the known
+# Sunshine virtual-pad name. A measured session created the device 47 seconds after
+# the app launched, so a short timeout races controller initialization. Keyboard/mouse-
+# only clients simply time out and continue.
+# The fullscreen Zenity progress window is visible in the Moonlight stream while
+# this wrapper waits. It tells the client to press a controller button, which is
+# required before Sunshine creates the virtual Xbox device.
+GAMEPAD_PROGRESS_PID=""
+GAMEPAD_PROGRESS_FD=""
+
+close_gamepad_countdown() {
+    if [ -n "$GAMEPAD_PROGRESS_FD" ]; then
+        printf '100\n' >&"$GAMEPAD_PROGRESS_FD" 2>/dev/null || true
+        eval "exec ${GAMEPAD_PROGRESS_FD}>&-" 2>/dev/null || true
+        GAMEPAD_PROGRESS_FD=""
+    fi
+    if [ -n "$GAMEPAD_PROGRESS_PID" ]; then
+        wait "$GAMEPAD_PROGRESS_PID" 2>/dev/null || true
+        GAMEPAD_PROGRESS_PID=""
+    fi
+}
+
+start_gamepad_countdown() {
+    # A UI failure must not prevent a keyboard/mouse-only connection.
+    coproc GAMEPAD_COUNTDOWN {
+        zenity --progress \
+            --title="Moonlight Steam" \
+            --text="Waiting for Moonlight virtual gamepad...\nPress any controller button now.\nStarting Steam automatically when detected." \
+            --percentage=0 \
+            --no-cancel \
+            --auto-close \
+            --width=560 2>/dev/null
+    }
+    GAMEPAD_PROGRESS_PID="$GAMEPAD_COUNTDOWN_PID"
+    GAMEPAD_PROGRESS_FD="${GAMEPAD_COUNTDOWN[1]}"
+}
+
+wait_for_sunshine_gamepad() {
+    local timeout=60 elapsed remaining percent node name
+
+    start_gamepad_countdown
+    for ((elapsed = 0; elapsed < timeout; elapsed++)); do
+        remaining=$((timeout - elapsed))
+        percent=$((elapsed * 100 / timeout))
+        printf '# Waiting for controller input — %ss remaining\n%d\n' "$remaining" "$percent" >&"$GAMEPAD_PROGRESS_FD" 2>/dev/null || true
+
+        for node in /sys/class/input/js*/device/name; do
+            [ -r "$node" ] || continue
+            name=$(<"$node")
+            if [ "$name" = "Sunshine X-Box One (virtual) pad" ]; then
+                log "Sunshine virtual gamepad ready: ${node%/device/name}"
+                PAD_SEEN=1
+                close_gamepad_countdown
+                # Wait a little longer for the matching evdev node to be ready,
+                # reducing the chance that SDL/gamescope scans before it exists.
+                sleep 1
+                return 0
+            fi
+        done
+        sleep 1
+    done
+
+    close_gamepad_countdown
+    log "Sunshine virtual gamepad not present after 60s; continuing for keyboard/mouse client"
+    return 1
+}
+
+wait_for_sunshine_gamepad || true
+
+if [ -n "$APP_ID" ]; then
+    STEAM_TARGET="steam://rungameid/$APP_ID"
+    log "launching Steam app $APP_ID inside gamescope"
+else
+    STEAM_TARGET="-bigpicture"
+    log "launching Steam Big Picture inside gamescope"
+fi
+
+# Gamescope path: only on cold start (a running Steam instance can't be wrapped).
+# Use the SDL backend deliberately. In this LXC, SDL detects a container and
+# disables its udev integration, then monitors gamepad devices with inotify/polling.
+# That lets it detect Sunshine's Xbox uinput device, which is created only after
+# the Moonlight client connects. The default wlroots/libinput path relies on udev
+# hotplug and misses that dynamic device in this container.
+# gamescope still provides its 1920x1080 compositor for Big Picture.
+# The old design exec'd gamescope, which replaced this script entirely: the
+# TERM cleanup trap and the disconnect detection below simply never ran during
+# a gamescope session. gamescope now runs in the background so this wrapper
+# stays alive as the supervisor (see the loop at the bottom).
+
+if [ -z "$(steam_pid)" ] && check_gamescope; then
+    GAMESCOPE_STARTED=1
+    log "starting gamescope (SDL input backend)"
+    # Backgrounded deliberately (no exec) so the supervisor loop survives.
+    # shellcheck disable=SC2086
+    $GAMERUN "$GS" --backend sdl -W 1920 -H 1080 -r 120 --framerate-limit 1 -f -e -- \
+        env VK_ICD_FILENAMES="$HOME/nvidia-vk/nvidia_icd.json" \
+            __GLX_VENDOR_LIBRARY_NAME=nvidia \
+            __NV_PRIME_RENDER_OFFLOAD=1 \
+            LD_LIBRARY_PATH="/usr/lib/i386-linux-gnu" \
+            STEAM_RUNTIME=1 \
+            DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}" \
+            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+            XDG_CONFIG_HOME="$HOME/.config" \
+            XDG_DATA_HOME="$HOME/.local/share" \
+            XDG_CACHE_HOME="$HOME/.cache" \
+            HOME="$HOME" \
+            LANG="${LANG:-C.UTF-8}" \
+        "$STEAM" $STEAM_CEF_FLAGS $STEAM_TARGET &
+fi
+
+if [ "$GAMESCOPE_STARTED" = 0 ]; then
+# Fallback: direct launch (works with running or cold Steam). Skipped when
+# gamescope just started, otherwise Steam would be launched twice.
+# NOTE: CEF flags only take effect on cold start. If Steam is already
+# running without them, restart Steam first.
+if [ -n "$(steam_pid)" ]; then
+    if [ -n "$APP_ID" ]; then
+        log "Steam already running, launching app $APP_ID"
+        "$STEAM" "steam://rungameid/$APP_ID" >/dev/null 2>&1 || true
+    else
+        log "Steam already running, opening Big Picture (CEF flags need cold start to apply)"
+        "$STEAM" "steam://open/bigpicture" >/dev/null 2>&1 || true
+    fi
+else
+    # Single-instance guard (2026-09-19): concurrent Moonlight taps race and spawn
+    # duplicate Steam mains that fight over WebUI transport (white windows).
+    # Only the lock winner cold-starts; losers forward the URL to it.
+    # (flock releases automatically when this wrapper exits.)
+    exec 9>"$HOME/.cache/moonlight-steam.lock"
+    if flock -n 9; then
+        log "cold-starting Steam (with CEF GLX fix)"
+        # shellcheck disable=SC2086
+        setsid env STEAM_RUNTIME=1 $GAMERUN "$STEAM" $STEAM_CEF_FLAGS $STEAM_TARGET >/dev/null 2>&1 < /dev/null &
+    else
+        log "another launcher is cold-starting, waiting then forwarding URL"
+        sleep 12
+        if [ -n "$APP_ID" ]; then
+            "$STEAM" "steam://rungameid/$APP_ID" >/dev/null 2>&1 || true
+        else
+            "$STEAM" "steam://open/bigpicture" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+fi
+
+# Supervise until Steam exits or the client disconnects for good. A brief
+# network drop must NOT kill the session (unsaved game state!), so a
+# disconnect only starts a grace timer; reconnecting clears it. The old
+# heuristic "virtual pad vanished" is gone: Sunshine destroys the pad on
+# disconnect and recreates it on reconnect, and a poll can sample right in
+# the gap and kill a perfectly healthy session.
+DISCONNECT_GRACE=120
+disc_since=0
+start_disconnect_watcher
+while :; do
+    if [ -e "$DISCONNECT_FLAG" ]; then
+        if [ "$disc_since" -eq 0 ]; then
+            disc_since=$(date +%s)
+            log "client disconnected; keeping session for ${DISCONNECT_GRACE}s grace"
+        elif [ $(( $(date +%s) - disc_since )) -ge "$DISCONNECT_GRACE" ]; then
+            log "no reconnect within ${DISCONNECT_GRACE}s; tearing down Steam/gamescope"
+            kill_steam_and_gamescope
+            stop_disconnect_watcher
+            rm -f "$DISCONNECT_FLAG"
+            exit 0
+        fi
+    elif [ "$disc_since" -ne 0 ]; then
+        disc_since=0
+        log "client reconnected within grace; session resumed"
+        # gamescope's SDL backend watches /dev/input via inotify/polling (no
+        # udev here), so the recreated Sunshine pad should hot-attach. If the
+        # pad still does not respond after a resume, the next grace expiry or
+        # a clean relaunch of the app recovers it.
+    fi
+    if [ -z "$(steam_pid)" ] && ! pgrep -u "${USER:-sunshine}" -x gamescope >/dev/null 2>&1; then
+        stop_disconnect_watcher
+        rm -f "$DISCONNECT_FLAG"
+        exit 0
+    fi
+    sleep 2
+done
